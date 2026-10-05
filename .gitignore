@@ -1,0 +1,7 @@
+__pycache__/
+*.py[cod]
+/rules.ini
+/.venv/
+/credentials.json
+/client_profile.json
+/log/
