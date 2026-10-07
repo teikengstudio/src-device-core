@@ -25,8 +25,15 @@ def get_runtime(config_name):
 def shutdown_all():
     with _runtimes_lock:
         runtimes = list(_runtimes.values())
+    errors = []
     for runtime in runtimes:
-        runtime.shutdown()
+        try:
+            runtime.shutdown()
+        except Exception as exc:
+            logger.error(_public_error(exc))
+            errors.append(_public_error(exc))
+    if errors:
+        raise CloudConnectionError("Cloud shutdown could not be confirmed: " + "; ".join(errors))
 
 
 class CloudRuntime:
@@ -40,6 +47,7 @@ class CloudRuntime:
         self._viewers = set()
         self._scheduler = False
         self._scheduler_allowed = False
+        self._lease = None
         self._pause_requested = False
         self._paused = False
         self._control_owner = None
@@ -53,6 +61,7 @@ class CloudRuntime:
         self._fps_started = time.monotonic()
         self._connect_thread = None
         self._closing = False
+        self._stop_failed = False
         self._error = None
         self._grace_timer = None
         self._grace_epoch = 0
@@ -77,13 +86,16 @@ class CloudRuntime:
     def _frame(self, image, count):
         now = time.monotonic()
         with self._lock:
-            if now - self._frame_at < 0.1:
+            if self._closing or not self.client.running or now - self._frame_at < 0.1:
                 return
+            generation = self._generation
         if image.size != (1280, 720):
             return
         stream = io.BytesIO()
         image.save(stream, "JPEG", quality=75)
         with self._lock:
+            if self._closing or generation != self._generation or not self.client.running:
+                return
             self._jpeg = stream.getvalue()
             self._frame_at = now
             self._fps_count += 1
@@ -95,6 +107,8 @@ class CloudRuntime:
 
     def _connected(self):
         with self._lock:
+            if self._closing or self._cancel_event.is_set():
+                return
             self._generation += 1
             self._pressed.clear()
             self._control_owner = self._pending_owner = None
@@ -110,16 +124,18 @@ class CloudRuntime:
                 self._bridge = {"commands": State.manager.Queue(128),
                                 "replies": State.manager.dict(),
                                 "state": State.manager.dict(),
-                                "heartbeat": State.manager.dict(at=time.monotonic())}
+                                "heartbeat": State.manager.dict()}
+                if self._scheduler_allowed:
+                    self._bridge["heartbeat"][self._lease] = time.monotonic()
                 self._bridge["state"].update(self.snapshot())
                 threading.Thread(target=self._commands, name="cloud-bridge", daemon=True).start()
                 threading.Thread(target=self._publish, name="cloud-status", daemon=True).start()
-            return self._bridge
+            return dict(self._bridge, lease=self._lease)
 
     def snapshot(self):
         with self._lock:
             self._grant_control()
-            return {"state": "Disconnecting" if self._closing else self.client.status,
+            return {"state": self._error if self._stop_failed else "Disconnecting" if self._closing else self.client.status,
                     "running": self.client.running, "error": self._error or self.client.error,
                     "connected": self.client.running,
                     "busy": self._closing or self.client.status in ("Authenticating", "Waiting in queue", "Connecting", "Reconnecting"),
@@ -129,6 +145,7 @@ class CloudRuntime:
                     "pending_owner": self._pending_owner,
                     "control_owner": self._control_owner, "scheduler": self._scheduler,
                     "generation": self._generation,
+                    "lease": self._lease, "scheduler_allowed": self._scheduler_allowed,
                     "frame_age": time.monotonic() - self._frame_at if self._frame_at else None,
                     "frame_width": 1280, "frame_height": 720,
                     "fps": self._fps if self.client.running and time.monotonic() - self._frame_at <= 1 else 0,
@@ -147,6 +164,7 @@ class CloudRuntime:
             if self.client.running or self._connect_thread and self._connect_thread.is_alive():
                 return
             self._error = None
+            self._cancel_grace()
             self._cancel_event = threading.Event()
             self._connect_thread = threading.Thread(target=self._connect, args=(self._cancel_event,), name="cloud-connect", daemon=True)
             self._connect_thread.start()
@@ -163,9 +181,11 @@ class CloudRuntime:
         self.client.release_touches()
         self._pressed.clear()
 
-    def _stop(self, manual=False, epoch=None, release_scheduler=False, revoke=True):
+    def _stop(self, manual=False, epoch=None, release_scheduler=False, revoke=True, lease=None):
         with self._stop_lock:
             with self._lock:
+                if lease is not None and lease != self._lease:
+                    raise CloudConnectionError("Cloud scheduler lease was revoked.")
                 if manual and self._scheduler:
                     raise CloudConnectionError("The scheduler owns this session; stop the script first.")
                 if epoch is not None and (epoch != self._grace_epoch or self._viewers or self._scheduler):
@@ -175,48 +195,77 @@ class CloudRuntime:
                     self._scheduler = False
                     if revoke:
                         self._scheduler_allowed = False
-                    self._generation += 1
+                self._generation += 1
                 self._cancel_event.set()
-                self._release_touches()
                 self._pending_owner = self._control_owner = None
                 self._paused = self._pause_requested = False
+                self._jpeg = None
+                self._frame_at = 0.0
                 self._cancel_grace()
             try:
+                try:
+                    with self._lock:
+                        self._release_touches()
+                except Exception as exc:
+                    logger.warning(_public_error(exc))
                 from .login import get_login
                 get_login(self.config_name).cancel()
                 self.client.stop()
                 thread = self._connect_thread
                 if thread is not None:
                     thread.join(timeout=1)
+                    if thread.is_alive():
+                        raise CloudConnectionError("Cloud connection is still closing; retry stop before restarting.")
             except Exception as exc:
                 with self._lock:
+                    self._stop_failed = True
                     self._error = _public_error(exc)
                 raise
+            else:
+                with self._lock:
+                    self._closing = self._stop_failed = False
+                    self._error = None
             finally:
                 with self._lock:
-                    self._closing = False
-                    self._jpeg = None
+                    self._pressed.clear()
+                    if self._bridge is not None:
+                        self._bridge["state"].update(self.snapshot())
 
     def disconnect(self):
         self._stop(manual=True)
 
     def scheduler_acquire(self):
         with self._lock:
-            if self._closing or self._shutdown.is_set():
+            if self._closing or self._stop_pending.is_set() or self._shutdown.is_set():
                 raise CloudConnectionError("Cloud session is closing.")
+            self._lease = uuid.uuid4().hex
             self._scheduler = True
             self._scheduler_allowed = True
             self._heartbeat_expired = False
             if self._bridge is not None:
-                self._bridge["heartbeat"]["at"] = time.monotonic()
+                self._bridge["heartbeat"].clear()
+                self._bridge["heartbeat"][self._lease] = time.monotonic()
+                self._bridge["replies"].clear()
             self._cancel_grace()
             if self._control_owner is not None:
                 self._pause_requested = self._paused = True
+            if self._bridge is not None:
+                self._bridge["state"].update(self.snapshot())
             return self._generation
 
-    def scheduler_release(self, revoke=True):
-        # Parent stop/child exit must never wait for a paused worker to acknowledge.
-        self._stop(release_scheduler=True, revoke=revoke)
+    def scheduler_release(self, revoke=True, lease=None):
+        # Revoke before waiting for a previous stop or a paused worker.
+        with self._lock:
+            if lease is not None and lease != self._lease:
+                raise CloudConnectionError("Cloud scheduler lease was revoked.")
+            lease = self._lease
+            if revoke:
+                self._scheduler_allowed = False
+            self._scheduler = False
+            self._closing = True
+            if self._bridge is not None:
+                self._bridge["state"].update(self.snapshot())
+        self._stop(release_scheduler=True, revoke=revoke, lease=lease)
 
     def request_pause(self):
         with self._lock:
@@ -282,8 +331,8 @@ class CloudRuntime:
     def _expire_viewers(self, epoch):
         try:
             self._stop(epoch=epoch)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.warning(_public_error(exc))
 
     def take_control(self, viewer_id):
         self._viewer_id(viewer_id)
@@ -354,8 +403,14 @@ class CloudRuntime:
     def capture(self, timeout=5):
         return self.client.capture(timeout=timeout)
 
-    def _reply(self, request_id, ok, value):
+    def _check_lease(self, lease, allow_revoked=False):
+        if lease is None or lease != self._lease or not allow_revoked and not self._scheduler_allowed:
+            raise CloudConnectionError("Cloud scheduler lease was revoked; start the script again from WebUI.")
+
+    def _reply(self, request_id, lease, ok, value):
         with self._lock:
+            if lease != self._lease:
+                return
             replies = self._bridge["replies"]
             if ok and isinstance(value, tuple) and isinstance(value[1], bytes):
                 frames = [(key, reply) for key, reply in replies.items() if reply[1] and isinstance(reply[2], tuple)]
@@ -367,108 +422,122 @@ class CloudRuntime:
                 replies.pop(oldest, None)
             replies[request_id] = (time.monotonic(), ok, value)
 
-    def _capture_reply(self, request_id, timeout, generation):
+    def _capture_reply(self, request_id, lease, timeout, generation):
         try:
             with self._lock:
+                self._check_lease(lease)
                 self._scheduler_ready(generation)
             image = self.capture(timeout)
             with self._lock:
+                self._check_lease(lease)
                 self._scheduler_ready(generation)
-                self._reply(request_id, True, (image.size, image.tobytes()))
+                self._reply(request_id, lease, True, (image.size, image.tobytes()))
         except Exception as exc:
-            self._reply(request_id, False, _public_error(exc))
+            self._reply(request_id, lease, False, _public_error(exc))
         finally:
             self._capture_slots.release()
 
-    def _wallet_reply(self, request_id):
+    def _wallet_reply(self, request_id, lease):
         try:
-            self._reply(request_id, True, self.client.wallet_info())
+            with self._lock:
+                self._check_lease(lease)
+            value = self.client.wallet_info()
+            with self._lock:
+                self._check_lease(lease)
+                self._reply(request_id, lease, True, value)
         except Exception as exc:
-            self._reply(request_id, False, _public_error(exc))
+            self._reply(request_id, lease, False, _public_error(exc))
 
     def _commands(self):
         while not self._shutdown.is_set():
             try:
-                request_id, method, args = self._bridge["commands"].get(timeout=0.2)
+                request_id, lease, method, args = self._bridge["commands"].get(timeout=0.2)
             except queue.Empty:
                 continue
             except (EOFError, OSError):
                 return
             try:
-                if method == "capture":
-                    timeout, generation = args
-                    if type(timeout) not in (int, float) or not 0 < timeout <= 60:
-                        raise ValueError("Invalid capture timeout")
-                    if not self._capture_slots.acquire(blocking=False):
-                        raise CloudConnectionError("Cloud capture request limit reached.")
-                    threading.Thread(target=self._capture_reply, args=(request_id, timeout, generation), daemon=True).start()
-                    continue
-                if method == "start" and not args:
-                    with self._lock:
-                        if not self._scheduler_allowed:
-                            raise CloudConnectionError("Cloud scheduler lease was revoked; start the script again from WebUI.")
-                        self.scheduler_acquire()
+                with self._lock:
+                    self._check_lease(lease, allow_revoked=method == "stop")
+                    if method == "capture":
+                        timeout, generation = args
+                        if type(timeout) not in (int, float) or not 0 < timeout <= 60:
+                            raise ValueError("Invalid capture timeout")
+                        if not self._capture_slots.acquire(blocking=False):
+                            raise CloudConnectionError("Cloud capture request limit reached.")
+                        threading.Thread(target=self._capture_reply, args=(request_id, lease, timeout, generation), daemon=True).start()
+                        continue
+                    if method == "start" and not args:
+                        if self._closing or self._stop_pending.is_set():
+                            raise CloudConnectionError("Cloud session is still closing.")
+                        self._scheduler = True
+                        self._heartbeat_expired = False
+                        self._bridge["heartbeat"][lease] = time.monotonic()
+                        self._cancel_grace()
+                        if self._control_owner is not None:
+                            self._pause_requested = self._paused = True
                         self.connect()
-                    value = None
-                elif method == "wallet" and not args:
-                    threading.Thread(target=self._wallet_reply, args=(request_id,), daemon=True).start()
-                    continue
-                elif method == "checkpoint" and not args:
-                    value = self._checkpoint()
-                elif method == "input" and len(args) == 2:
-                    value = self._scheduler_input(args[0], args[1])
-                elif method == "stop" and not args:
-                    # Connection/stop work must not block checkpoint/input dispatch.
-                    if self._stop_pending.is_set():
-                        raise CloudConnectionError("Cloud stop is already in progress.")
-                    self._stop_pending.set()
-                    threading.Thread(target=self._stop_reply, args=(request_id,), daemon=True).start()
-                    continue
-                else:
-                    raise ValueError("Unsupported cloud bridge command")
-                self._bridge["state"].update(self.snapshot())
-                self._reply(request_id, True, value)
+                        value = None
+                    elif method == "wallet" and not args:
+                        threading.Thread(target=self._wallet_reply, args=(request_id, lease), daemon=True).start()
+                        continue
+                    elif method == "checkpoint" and not args:
+                        value = self._checkpoint()
+                    elif method == "input" and len(args) == 2:
+                        value = self._scheduler_input(args[0], args[1])
+                    elif method == "stop" and len(args) == 1 and type(args[0]) is bool:
+                        # Cleanup never waits for a paused worker checkpoint.
+                        if self._stop_pending.is_set():
+                            raise CloudConnectionError("Cloud stop is already in progress.")
+                        self._stop_pending.set()
+                        self._scheduler = False
+                        self._closing = True
+                        if args[0]:
+                            self._scheduler_allowed = False
+                        self._bridge["state"].update(self.snapshot())
+                        threading.Thread(target=self._stop_reply, args=(request_id, lease, args[0]), daemon=True).start()
+                        continue
+                    else:
+                        raise ValueError("Unsupported cloud bridge command")
+                    self._bridge["state"].update(self.snapshot())
+                    self._reply(request_id, lease, True, value)
             except Exception as exc:
-                self._reply(request_id, False, _public_error(exc))
+                self._reply(request_id, lease, False, _public_error(exc))
 
-    def _stop_reply(self, request_id):
+    def _stop_reply(self, request_id, lease, revoke):
         try:
-            self.scheduler_release(revoke=False)
-            self._reply(request_id, True, None)
+            self.scheduler_release(revoke=revoke, lease=lease)
+            ok, value = True, None
         except Exception as exc:
-            self._reply(request_id, False, _public_error(exc))
-        finally:
+            ok, value = False, _public_error(exc)
+        with self._lock:
             self._stop_pending.clear()
+            self._reply(request_id, lease, ok, value)
 
     def _publish(self):
         while not self._shutdown.wait(0.1):
             try:
-                self._bridge["state"].update(self.snapshot())
                 with self._lock:
-                    expired = self._scheduler and not self._closing and not self._heartbeat_expired and time.monotonic() - self._bridge["heartbeat"].get("at", 0) > 30
+                    self._bridge["state"].update(self.snapshot())
+                    expired = self._scheduler and not self._closing and not self._heartbeat_expired and time.monotonic() - self._bridge["heartbeat"].get(self._lease, 0) > 30
                     if expired:
                         self._heartbeat_expired = True
-                        threading.Thread(target=self._expire_scheduler, daemon=True).start()
-                for request_id, reply in list(self._bridge["replies"].items()):
-                    if time.monotonic() - reply[0] > 70:
-                        self._bridge["replies"].pop(request_id, None)
+                        threading.Thread(target=self._expire_scheduler, args=(self._lease,), daemon=True).start()
+                    for request_id, reply in list(self._bridge["replies"].items()):
+                        if time.monotonic() - reply[0] > 70:
+                            self._bridge["replies"].pop(request_id, None)
             except (EOFError, OSError, BrokenPipeError):
                 return
 
-    def _expire_scheduler(self):
+    def _expire_scheduler(self, lease):
         try:
-            self.scheduler_release()
-        except Exception:
-            pass
+            self.scheduler_release(lease=lease)
+        except Exception as exc:
+            logger.warning(_public_error(exc))
 
     def shutdown(self):
         self._shutdown.set()
-        try:
-            self.scheduler_release()
-        except Exception:
-            pass
-        finally:
-            self._shutdown.set()
+        self.scheduler_release()
 
 
 class CloudProxy:
@@ -476,12 +545,14 @@ class CloudProxy:
 
     def __init__(self, bridge):
         self.bridge = bridge
+        self._lease = bridge.get("lease")
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread = None
 
     @property
     def running(self):
-        return bool(self.bridge["state"].get("running", False))
+        state = self.bridge["state"]
+        return self._lease == state.get("lease") and state.get("scheduler_allowed", False) and bool(state.get("running", False))
 
     @property
     def status(self):
@@ -495,10 +566,17 @@ class CloudProxy:
     def generation(self):
         return self.bridge["state"].get("generation", 0)
 
+    def _check_lease(self, allow_revoked=False):
+        state = self.bridge["state"]
+        if self._lease is None or self._lease != state.get("lease") or not allow_revoked and not state.get("scheduler_allowed", False):
+            self._heartbeat_stop.set()
+            raise CloudConnectionError("Cloud scheduler lease was revoked; start the script again from WebUI.")
+
     def _call(self, method, *args, timeout=10):
         request_id = uuid.uuid4().hex
         try:
-            self.bridge["commands"].put((request_id, method, args), timeout=2)
+            self._check_lease(allow_revoked=method == "stop")
+            self.bridge["commands"].put((request_id, self._lease, method, args), timeout=2)
             deadline = time.monotonic() + timeout
             while time.monotonic() < deadline:
                 reply = self.bridge["replies"].pop(request_id, None)
@@ -506,37 +584,45 @@ class CloudProxy:
                     if not reply[1]:
                         raise CloudConnectionError(reply[2])
                     return reply[2]
+                self._check_lease(allow_revoked=method == "stop")
                 time.sleep(0.02)
         except (EOFError, OSError, queue.Full):
             raise CloudConnectionError("Cloud WebUI bridge is unavailable.") from None
         raise CloudConnectionError("Cloud bridge request timed out.")
 
     def start(self, cancel_event=None):
+        self._check_lease()
         if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive() or self._heartbeat_stop.is_set():
             self._heartbeat_stop = threading.Event()
             self._heartbeat_thread = threading.Thread(target=self._heartbeat, args=(self._heartbeat_stop,), daemon=True)
             self._heartbeat_thread.start()
-        self._call("start")
-        last_queue_log = ""
-        while not self.running:
-            if cancel_event is not None and cancel_event.is_set():
-                self.stop()
-                raise CloudConnectionError("Cloud connection was cancelled.")
-            if self.error:
-                raise CloudConnectionError(self.error)
-            if not self.bridge["state"].get("scheduler", False):
-                raise CloudConnectionError("Cloud scheduler lease was released.")
-            queue_log = self.bridge["state"].get("queue_log", "")
-            if queue_log and queue_log != last_queue_log:
-                logger.info(queue_log)
-                last_queue_log = queue_log
-            time.sleep(0.05)
+        try:
+            self._call("start")
+            last_queue_log = ""
+            while not self.running:
+                self._check_lease()
+                if cancel_event is not None and cancel_event.is_set():
+                    self.stop()
+                    raise CloudConnectionError("Cloud connection was cancelled.")
+                if self.error:
+                    raise CloudConnectionError(self.error)
+                if not self.bridge["state"].get("scheduler", False):
+                    raise CloudConnectionError("Cloud scheduler lease was released.")
+                queue_log = self.bridge["state"].get("queue_log", "")
+                if queue_log and queue_log != last_queue_log:
+                    logger.info(queue_log)
+                    last_queue_log = queue_log
+                time.sleep(0.05)
+        except Exception:
+            self._heartbeat_stop.set()
+            raise
 
     def _heartbeat(self, stop_event):
         while not stop_event.is_set():
             try:
-                self.bridge["heartbeat"]["at"] = time.monotonic()
-            except (EOFError, OSError):
+                self._check_lease()
+                self.bridge["heartbeat"][self._lease] = time.monotonic()
+            except (EOFError, OSError, CloudConnectionError):
                 return
             stop_event.wait(1)
 
@@ -570,6 +656,6 @@ class CloudProxy:
         generation = self._operation_checkpoint()
         self._call("input", validate_input(dict(type="clipboard", text=text)), generation)
 
-    def stop(self):
+    def stop(self, revoke=False):
         self._heartbeat_stop.set()
-        self._call("stop", timeout=70)
+        self._call("stop", revoke, timeout=70)

@@ -271,6 +271,7 @@ class CloudAccount:
         authenticator = game.authenticator
         if cookie and not force_password:
             valid, info = self._check(authenticator, cookie)
+            check_cancelled()
             if valid:
                 apply(cookie, False)
                 return
@@ -283,6 +284,7 @@ class CloudAccount:
         bootstrap.setdefault("_MHYUUID", data["profile"]["device_profile"]["device_id"])
         existing_cookie = "; ".join(f"{key}={value}" for key, value in bootstrap.items())
         try:
+            check_cancelled()
             new_cookie = authenticator.login_password(
                 credentials["account"], credentials["password"], encrypted=True,
                 existing_cookie=existing_cookie, verify=False, on_status=lambda message: None,
@@ -316,6 +318,7 @@ class CloudAccount:
         except Exception:
             check_cancelled()
             raise CloudAccountError("Cloud password login failed; no retry was attempted.", kind="authentication") from None
+        check_cancelled()
         valid, info = self._check(authenticator, new_cookie)
         if not valid:
             self._raise_check_failure(info)

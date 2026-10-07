@@ -862,6 +862,8 @@ class GameSession:
         self._video_received = False
         self._stop_ack = asyncio.Event()
         self._stop_lock = asyncio.Lock()
+        self._stop_requested = False
+        self._signaling_task: asyncio.Task | None = None
         self.heartbeat_task: asyncio.Task | None = None
         self.keep_playing_task: asyncio.Task | None = None
         self.stop_watcher_task: asyncio.Task | None = None
@@ -926,8 +928,8 @@ class GameSession:
 
     @property
     def stopped(self) -> bool:
-        """判断外部停止事件是否已触发。"""
-        return self.stop_event is not None and self.stop_event.is_set()
+        """判断本地退出请求或外部停止事件是否已触发。"""
+        return self._stop_requested or (self.stop_event is not None and self.stop_event.is_set())
 
     # ------------------------------------------------------------------
     # 通用辅助
@@ -965,8 +967,10 @@ class GameSession:
                 logger.debug(LogText.colorize(LogText.shorten(detail, self.config.ws_payload_limit), line_color,
                                               self.config.color))
 
-    async def _ws_send(self, payload: bytes) -> None:
+    async def _ws_send(self, payload: bytes, *, allow_stopped: bool = False) -> None:
         """发送一帧二进制 WebSocket 数据。"""
+        if self.stopped and not allow_stopped:
+            return
         self._log_ws("SEND", payload)
         await self.ws.send(payload)
 
@@ -985,13 +989,15 @@ class GameSession:
     # ------------------------------------------------------------------
     def send_input(self, action: dict) -> bool:
         """把一个输入动作排进本会话事件循环。可从任意线程安全调用。"""
-        if self.loop is None:
+        if self.loop is None or self.loop.is_closed() or (self.stopped and action.get("type") not in ("up", "key_up", "touch_up")):
             return False
         self.loop.call_soon_threadsafe(self._dispatch_input, action)
         return True
 
     def _dispatch_input(self, action: dict) -> None:
         """把输入动作编码并选择可用通道发送。"""
+        if self.stopped and action.get("type") not in ("up", "key_up", "touch_up"):
+            return
         if action.get("type") == "clipboard":
             text = str(action.get("text") or "")
             self.sdk_game_data.set_clipboard_text(text)
@@ -1068,7 +1074,7 @@ class GameSession:
         try:
             while not self.stopped:
                 await asyncio.sleep(60)
-                if self.ws is None:
+                if self.ws is None or self.stopped:
                     return
                 await self._send_keep_playing("periodic")
         except asyncio.CancelledError:
@@ -1084,7 +1090,7 @@ class GameSession:
 
     async def _start_game_control_channel(self, session_id: int) -> None:
         """握手拿到 session_id 后，尝试建立独立的游戏控制通道。"""
-        if self.has_game_control_channel:
+        if self.stopped or self.has_game_control_channel:
             return
         if not any(self.game_control_urls):
             self.status("game control channel skipped: no url", level=logging.DEBUG)
@@ -1110,6 +1116,8 @@ class GameSession:
 
     def _on_track(self, track) -> None:
         """处理远端媒体轨道并启动消费任务。"""
+        if self.stopped:
+            return
         self.status(f"track {track.kind}", level=logging.DEBUG)
         is_video = track.kind == "video"
         consumer = TrackConsumer(
@@ -1125,7 +1133,7 @@ class GameSession:
         self._spawn(consumer.consume(track), name=f"consume-{track.kind}")
 
     def _video_ended(self) -> None:
-        if self.ws is not None and self.ws.state.name == "OPEN":
+        if not self.stopped and self.ws is not None and self.ws.state.name == "OPEN":
             self._spawn(self.ws.close(), name="video-ended")
 
     def _mark_video_received(self) -> None:
@@ -1134,6 +1142,8 @@ class GameSession:
 
     def _on_datachannel(self, channel) -> None:
         """处理远端 DataChannel 并注册通道回调。"""
+        if self.stopped:
+            return
         logger.debug("datachannel %s ordered=%s", channel.label, channel.ordered)
         self.rtc_channel = channel
         if self.actions:
@@ -1145,6 +1155,8 @@ class GameSession:
         @channel.on("open")
         def on_open():
             """处理 DataChannel 打开事件。"""
+            if self.stopped:
+                return
             logger.debug("datachannel open %s", channel.label)
             if self.heartbeat_task is None or self.heartbeat_task.done():
                 self.heartbeat_task = asyncio.create_task(self._heartbeat_loop(channel))
@@ -1166,7 +1178,7 @@ class GameSession:
     async def _heartbeat_loop(self, channel) -> None:
         """每秒发一个心跳；通道可用时走游戏控制通道，否则走 DataChannel。"""
         heartbeat_id = 1
-        while getattr(channel, "readyState", "") == "open":
+        while not self.stopped and getattr(channel, "readyState", "") == "open":
             packet = Protocol.heartbeat_packet(heartbeat_id)
             if self.has_game_control_channel:
                 await self.gcc.send_data(packet)
@@ -1180,7 +1192,7 @@ class GameSession:
         state = self.pc.iceConnectionState
         if state == "failed":
             logger.warning("iceConnectionState %s", state)
-            if self.ws is not None:
+            if not self.stopped and self.ws is not None:
                 await self.ws.close()
         else:
             logger.debug("iceConnectionState %s", state)
@@ -1196,7 +1208,7 @@ class GameSession:
             logger.warning("connectionState %s", state)
         else:
             logger.debug("connectionState %s", state)
-        if state == "failed" and self.ws is not None:
+        if not self.stopped and state == "failed" and self.ws is not None:
             await self.ws.close()
 
     async def _on_icecandidate(self, candidate) -> None:
@@ -1310,11 +1322,13 @@ class GameSession:
         cmd_id = packet["cmd_id"]
         message = packet["message"]
         logger.debug("proxy packet %s message bytes %d", cmd_id, len(message))
-        if cmd_id == 20002:
-            self._parse_start_game_rsp(message)
-        elif cmd_id == 20005:
+        if cmd_id == 20005:
             await self._handle_stop_game(message)
             return
+        if self.stopped:
+            return
+        if cmd_id == 20002:
+            self._parse_start_game_rsp(message)
         if cmd_id == CMD_RTC_NOT_PLAYING_TIPS:
             await self._send_keep_playing("not_playing_tips")
         if cmd_id == CMD_RELIABLE_MESSAGE_QUEUE_DATA:
@@ -1385,11 +1399,19 @@ class GameSession:
         async with self._stop_lock:
             if self._stop_ack.is_set():
                 return
+            self._stop_requested = True
+            if self._signaling_task is not None:
+                self._signaling_task.cancel()
+            for task in tuple(self._tasks):
+                if task.get_name() != "gcc-send-input":
+                    task.cancel()
             if self.ws is None or self.ws.state.name != "OPEN":
                 raise ConnectionError("No open signaling channel for cloud exit")
+            deadline = asyncio.get_running_loop().time() + timeout
             try:
-                await self._ws_send(Protocol.stop_game(self.params))
-                await asyncio.wait_for(self._stop_ack.wait(), timeout)
+                await asyncio.wait_for(self._ws_send(Protocol.stop_game(self.params), allow_stopped=True), timeout)
+                remaining = max(0, deadline - asyncio.get_running_loop().time())
+                await asyncio.wait_for(self._stop_ack.wait(), remaining)
             finally:
                 await self.ws.close()
 
@@ -1397,27 +1419,24 @@ class GameSession:
     # 主循环
     # ------------------------------------------------------------------
     async def _stop_watcher(self) -> None:
-        """轮询 stop_event，被设置后关闭 WebSocket 以打断主循环的阻塞 recv。"""
+        """退出远端实例，接收循环继续等待 StopGameRsp。"""
         if self.stop_event is None:
             return
         while not self.stop_event.is_set():
-            await asyncio.sleep(0.1)
-        try:
-            if self.ws is not None:
-                await self.ws.close()
-        except Exception:
-            pass
+            await asyncio.sleep(0.05)
+        await self.stop()
 
     async def _await_start_game_rsp(self) -> None:
         """发送 StartGameReq 并阻塞等待 StartGameRsp 成功。"""
-        await self._ws_send(Protocol.start_game_frame(
-            self.params, terminal_type=9 if self.config.core_config.is_touch else 10,
-            link_tasks_ms=START_GAME_LINK_TASKS_MS,
-        ))
-        logger.debug("sent StartGameReq")
+        if not self.stopped:
+            await self._ws_send(Protocol.start_game_frame(
+                self.params, terminal_type=9 if self.config.core_config.is_touch else 10,
+                link_tasks_ms=START_GAME_LINK_TASKS_MS,
+            ))
+            logger.debug("sent StartGameReq")
 
         # 等待 StartGameRsp 成功后再发送 client hello，避免服务端状态错乱。
-        while not self.stopped:
+        while not self._stop_ack.is_set():
             message = await self._ws_recv()
             if isinstance(message, str):
                 logger.debug("text frame %s", message[:200])
@@ -1427,7 +1446,7 @@ class GameSession:
                 logger.debug("unexpected frame type=%s before StartGameRsp", frame["frame_type"])
                 continue
             packet = Protocol.parse_packet(frame["payload"])
-            if packet["cmd_id"] == 20002:
+            if packet["cmd_id"] == 20002 and not self.stopped:
                 self._parse_start_game_rsp(packet["message"])
                 return
             if packet["cmd_id"] == 20005:
@@ -1438,7 +1457,7 @@ class GameSession:
     async def _main_loop(self) -> None:
         """StartGameRsp 之后的主收发循环。"""
         deadline = None if self.config.max_seconds <= 0 else self.loop.time() + self.config.max_seconds
-        while (deadline is None or self.loop.time() < deadline) and not self.stopped:
+        while not self._stop_ack.is_set() and (deadline is None or self.loop.time() < deadline or self.stopped):
             message = await self._ws_recv()
             if isinstance(message, str):
                 logger.debug("text frame %s", message[:200])
@@ -1448,9 +1467,17 @@ class GameSession:
             if frame_type == FRAME_PROXY:
                 await self._handle_proxy_frame(frame["payload"])
             elif frame_type == FRAME_HANDSHAKE:
-                await self._handle_handshake_frame(frame["payload"])
-            elif frame_type == FRAME_SIGNALING:
-                await self._handle_signaling_frame(frame["payload"])
+                if not self.stopped:
+                    await self._handle_handshake_frame(frame["payload"])
+            elif frame_type == FRAME_SIGNALING and not self.stopped:
+                self._signaling_task = asyncio.create_task(self._handle_signaling_frame(frame["payload"]))
+                try:
+                    await self._signaling_task
+                except asyncio.CancelledError:
+                    if not self.stopped:
+                        raise
+                finally:
+                    self._signaling_task = None
             else:
                 logger.debug("frame %s bytes %d", frame_type, len(frame["payload"]))
         if deadline is not None and not self.stopped:
@@ -1477,15 +1504,20 @@ class GameSession:
             if self._stop_ack.is_set():
                 return
 
-            await self._ws_send(Protocol.ws_frame(FRAME_HANDSHAKE, CLIENT_HELLO_JSON))
-            logger.debug("sent client hello")
-            self.keep_playing_task = asyncio.create_task(self._keep_playing_loop())
+            if not self.stopped:
+                await self._ws_send(Protocol.ws_frame(FRAME_HANDSHAKE, CLIENT_HELLO_JSON))
+                logger.debug("sent client hello")
+                self.keep_playing_task = asyncio.create_task(self._keep_playing_loop())
 
-            # ICE candidate 回调依赖 self.ws 已就绪，故在此处注册。
-            self.pc.on("icecandidate")(self._on_icecandidate)
+                # ICE candidate 回调依赖 self.ws 已就绪，故在此处注册。
+                self.pc.on("icecandidate")(self._on_icecandidate)
 
             await self._main_loop()
-        except ConnectionClosed:
+            if not self._stop_ack.is_set():
+                raise ConnectionError("Cloud transport ended without acknowledged instance exit")
+        except ConnectionClosed as exc:
+            if not self._stop_ack.is_set():
+                raise ConnectionError("Cloud transport ended without acknowledged instance exit") from exc
             logger.debug("websocket connection closed")
         finally:
             await self._cleanup()
@@ -1500,14 +1532,13 @@ class GameSession:
         self.video_connected.set()
         if self.input_ready_callback is not None:
             self.input_ready_callback(False)
-        if self.stop_watcher_task is not None:
-            self.stop_watcher_task.cancel()
-        if self.keep_playing_task is not None:
-            self.keep_playing_task.cancel()
-        if self.heartbeat_task is not None:
-            self.heartbeat_task.cancel()
-        for task in list(self._tasks):
-            task.cancel()
+        tasks = [task for task in (self.stop_watcher_task, self.keep_playing_task, self.heartbeat_task, self._signaling_task)
+                 if task is not None]
+        tasks.extend(self._tasks)
+        for task in tasks:
+            if not task.done():
+                task.cancel()
+        await asyncio.gather(*tasks, return_exceptions=True)
         if self.gcc is not None:
             await self.gcc.close()
         try:

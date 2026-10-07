@@ -135,14 +135,15 @@ class CloudClient:
         finally:
             self._connected.clear()
             self._ready.set()
-            if not self.error:
-                self.status = "Disconnected"
+            self.status = self.error or "Disconnected"
 
     def _authenticate(self):
+        if self._stop_event.is_set():
+            return
         if self.auth_handler is not None:
             self.auth_handler(self._game, cancel_event=self._stop_event)
         else:
-            self.account.ensure_login(self._game)
+            self.account.ensure_login(self._game, cancel_event=self._stop_event)
 
     def _dispatch(self):
         login_retried = False
@@ -161,11 +162,18 @@ class CloudClient:
                     raise RuntimeError("dispatch stopped")
                 return self._game.dispatch(stop_event=self._stop_event)
             except Exception as exc:
+                dispatcher = self._game.dispatcher
+                finish = self._game.state.latest_finish_result
+                if finish is not None:
+                    self.error = "Cloud ticket acknowledgement failed; the allocated instance is being stopped."
+                    self._stop_event.set()
+                    return finish
+                if dispatcher.allocation_uncertain:
+                    self.error = "Cloud allocation or queue exit was not acknowledged; check the cloud queue and remaining time."
+                    self._allocation_uncertain = True
+                    raise CloudConnectionError(self.error) from None
                 if self._stop_event.is_set():
-                    if str(exc) != "dispatch stopped":
-                        self.error = "Cloud queue exit was not acknowledged; check the cloud queue."
-                        self._allocation_uncertain = True
-                    raise
+                    raise RuntimeError("dispatch stopped") from None
                 if not isinstance(exc, RuntimeError):
                     raise
                 if not login_retried and re.search(r"retcode=-100\b", str(exc)):
@@ -193,25 +201,21 @@ class CloudClient:
     async def _cancel_watcher(self, connection):
         while not self._stop_event.is_set() and not connection.done():
             await asyncio.sleep(0.05)
-        if not self._stop_event.is_set():
-            return
-        deadline = asyncio.get_running_loop().time() + 20
-        while not connection.done():
-            session = self._game.game_session
-            if session is not None and session.ws is not None and session.ws.state.name == "OPEN":
-                await session.stop()
-                return
-            if asyncio.get_running_loop().time() >= deadline:
-                raise TimeoutError("Cloud cancellation timed out")
-            await asyncio.sleep(0.05)
+        if self._stop_event.is_set():
+            self.release_touches()
+            await connection
 
     async def _connect_once(self, finish):
         self._game.last_session = None
-        connection = asyncio.create_task(self._game.connect(finish_result=finish))
+        connection = asyncio.create_task(self._game.connect(finish_result=finish, stop_event=self._stop_event))
         cancellation = asyncio.create_task(self._cancel_watcher(connection))
         capture = None
         try:
             await asyncio.sleep(0)
+            if self._stop_event.is_set():
+                await cancellation
+                await connection
+                return
             capture = asyncio.create_task(self._game.capture_video_frame(timeout=60))
             done, _ = await asyncio.wait((connection, capture, cancellation), return_when=asyncio.FIRST_COMPLETED)
             if cancellation in done:
@@ -306,6 +310,8 @@ class CloudClient:
             if finish is not None:
                 session = self._game.last_session
                 self._allocation_uncertain = session is None or not session._stop_ack.is_set()
+                if self._allocation_uncertain:
+                    self.error = self.error or "Cloud exit was not acknowledged; check remaining cloud time."
             self._game.dispatcher.close()
 
     def wallet_info(self):

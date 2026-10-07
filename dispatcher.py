@@ -126,6 +126,8 @@ class Dispatcher:
         self.session = requests.Session()
         self._runtime_combo_token = ""
         self.last_account_sync: dict | None = None
+        self.last_finish_result: dict | None = None
+        self.allocation_uncertain = False
         # _cookie_value 用; 仅在 cookie 文本变化时重新解析
         self._cookie_cache_source: str | None = None
         self._cookie_cache: dict[str, str] = {}
@@ -198,12 +200,17 @@ class Dispatcher:
         logger.log(level, message)
         emit_log_callback(line_callback, message, level)
 
+    @staticmethod
+    def _check_stopped(stop_event) -> None:
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("dispatch stopped")
+
     def _sleep(self, seconds: int, stop_event=None) -> None:
         """可被停止事件打断地等待一段时间。"""
+        self._check_stopped(stop_event)
         deadline = time.monotonic() + max(0, seconds)
         while time.monotonic() < deadline:
-            if stop_event is not None and stop_event.is_set():
-                raise RuntimeError("dispatch stopped")
+            self._check_stopped(stop_event)
             time.sleep(min(0.25, deadline - time.monotonic()))
 
     def _require_credentials(self) -> None:
@@ -211,10 +218,11 @@ class Dispatcher:
         if self.cookie is None:
             raise RuntimeError("missing Cookie: caller did not provide cookie")
 
-    def _post(self, url: str, body: dict, headers: dict, retries: int = 0) -> dict:
+    def _post(self, url: str, body: dict, headers: dict, retries: int = 0, stop_event=None) -> dict:
         """发送 JSON POST 请求并处理重试。"""
         last_error = None
         for attempt in range(retries + 1):
+            self._check_stopped(stop_event)
             try:
                 response = self.session.post(url, headers=headers, data=self._json(body).encode(), timeout=20)
                 try:
@@ -228,13 +236,14 @@ class Dispatcher:
                 last_error = exc
                 if attempt == retries:
                     break
-                time.sleep(1.5 * (attempt + 1))
+                self._sleep(1.5 * (attempt + 1), stop_event)
         raise last_error
 
-    def _get(self, url: str, headers: dict, params: dict | None = None, retries: int = 0) -> dict:
+    def _get(self, url: str, headers: dict, params: dict | None = None, retries: int = 0, stop_event=None) -> dict:
         """发送 GET 请求并处理重试。"""
         last_error = None
         for attempt in range(retries + 1):
+            self._check_stopped(stop_event)
             try:
                 response = self.session.get(url, headers=headers, params=params or {}, timeout=20)
                 try:
@@ -248,16 +257,16 @@ class Dispatcher:
                 last_error = exc
                 if attempt == retries:
                     break
-                time.sleep(1.5 * (attempt + 1))
+                self._sleep(1.5 * (attempt + 1), stop_event)
         raise last_error
 
-    def _dispatch_post(self, path: str, body: dict, headers: dict, retries: int = 0) -> dict:
+    def _dispatch_post(self, path: str, body: dict, headers: dict, retries: int = 0, stop_event=None) -> dict:
         """向调度 API 发送 JSON 请求。"""
-        return self._post(f"{BASE_URL}{path}", body, headers, retries=retries)
+        return self._post(f"{BASE_URL}{path}", body, headers, retries=retries, stop_event=stop_event)
 
-    def _dispatch_get(self, path: str, headers: dict, params: dict | None = None, retries: int = 0) -> dict:
+    def _dispatch_get(self, path: str, headers: dict, params: dict | None = None, retries: int = 0, stop_event=None) -> dict:
         """向云游戏 API 发送 GET 请求。"""
-        return self._get(f"{BASE_URL}{path}", headers, params=params, retries=retries)
+        return self._get(f"{BASE_URL}{path}", headers, params=params, retries=retries, stop_event=stop_event)
 
     @staticmethod
     def _assert_ok(name: str, response: dict) -> None:
@@ -433,7 +442,7 @@ class Dispatcher:
             },
         }
 
-    def _sync_web_account(self) -> dict:
+    def _sync_web_account(self, stop_event=None) -> dict:
         """同步对应的远端状态。"""
         verify_headers = self._web_headers()
         verify_headers.update({
@@ -443,7 +452,7 @@ class Dispatcher:
             "x-rpc-mi_referrer": "https://sr.mihoyo.com/cloud/#/",
             "x-rpc-sdk_version": WEB_SDK_VERSION,
         })
-        verify = self._post(WEB_VERIFY_URL, {}, verify_headers, retries=1)
+        verify = self._post(WEB_VERIFY_URL, {}, verify_headers, retries=1, stop_event=stop_event)
         self._assert_ok("webVerifyForGame", verify)
         channel_token = ((verify.get("data") or {}).get("token") or {}).get("token") or ""
         if not channel_token:
@@ -451,12 +460,12 @@ class Dispatcher:
 
         combo_headers = self._web_headers()
         combo_headers.update({"x-rpc-app_id": WEB_APP_ID, "x-rpc-channel_id": WEB_CHANNEL_ID, "x-rpc-mdk_version": WEB_MDK_VERSION})
-        web_login = self._post(WEB_LOGIN_URL, {"app_id": int(WEB_APP_ID), "channel_id": int(WEB_CHANNEL_ID)}, combo_headers, retries=1)
+        web_login = self._post(WEB_LOGIN_URL, {"app_id": int(WEB_APP_ID), "channel_id": int(WEB_CHANNEL_ID)}, combo_headers, retries=1, stop_event=stop_event)
         self._assert_ok("webLogin", web_login)
         web_login_data = web_login.get("data") or {}
         self._runtime_combo_token = self._build_combo_token(web_login_data)
         # Official WebUI initializes the cloud account before reading time or dispatching.
-        cloud_login = self._dispatch_post("/gamer/api/login", {}, self._dispatch_headers())
+        cloud_login = self._dispatch_post("/gamer/api/login", {}, self._dispatch_headers(), stop_event=stop_event)
         self._assert_ok("cloudLogin", cloud_login)
         sdk_login = self._sdk_login(channel_token, web_login_data)
         self.last_account_sync = {
@@ -470,10 +479,10 @@ class Dispatcher:
         }
         return self.last_account_sync
 
-    def init(self) -> dict:
+    def init(self, stop_event=None) -> dict:
         """初始化调度器账号态，必须在 run/wallet/queue 前调用。"""
         self._require_credentials()
-        return self._sync_web_account()
+        return self._sync_web_account(stop_event=stop_event)
 
     def _require_initialized(self) -> dict:
         """确保调用方已经显式完成 init。"""
@@ -514,6 +523,7 @@ class Dispatcher:
         notifications = self._dispatch_get(
             "/gamer/api/listNotifications", headers,
             params={"status": "NotificationStatusUnread", "type": "NotificationTypePopup", "is_sort": "true"},
+            stop_event=stop_event,
         )
         self._assert_ok("listNotifications", notifications)
         if stop_event is not None and stop_event.is_set():
@@ -534,12 +544,12 @@ class Dispatcher:
             # Free time can arrive before ACK; confirming the notification is not proof of granting time.
             if stop_event is not None and stop_event.is_set():
                 raise RuntimeError("dispatch stopped")
-            ack = self._dispatch_post("/gamer/api/ackNotification", {"id": notification["id"]}, headers)
+            ack = self._dispatch_post("/gamer/api/ackNotification", {"id": notification["id"]}, headers, stop_event=stop_event)
             self._assert_ok("ackNotification", ack)
             break
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("dispatch stopped")
-        wallet = self._dispatch_get(WALLET_GET_PATH, headers)
+        wallet = self._dispatch_get(WALLET_GET_PATH, headers, stop_event=stop_event)
         self._assert_ok("walletGet", wallet)
         if stop_event is not None and stop_event.is_set():
             raise RuntimeError("dispatch stopped")
@@ -713,6 +723,7 @@ class Dispatcher:
 
     def _finish_dispatch_result(self, result: dict, line_callback=None) -> dict:
         """统一记录调度完成结果并返回原始 finish_result。"""
+        self.last_finish_result = result
         self._line(
             line_callback,
             f"排队完成，队列类型：'{'星云币优先队列' if result.get('queue_type') == QUEUE_TYPE_COIN else '普通队列'}' 消耗：'{'普通时长' if str(result.get('cost_method')) == '0' else '星云币时长'}'",
@@ -786,35 +797,53 @@ class Dispatcher:
                 ticket_payload,
                 headers,
                 retries=2,
+                stop_event=stop_event,
             )
             self._assert_ok("getDispatchTicketInfo", ticket_info)
             ticket_data = ticket_info.get("data") or {}
             ticket_status = ticket_data.get("ticket_status")
             self._log_ticket_poll(attempt, str(ticket_status), ticket_data, line_callback)
             if ticket_status == "SUCCESS":
+                result = self._finish_dispatch_result(ticket_data["finish_result"], line_callback)
                 ack = self._dispatch_post("/dispatcher/api/ackDispatchTicket", ticket_payload, headers)
                 self._assert_ok("ackDispatchTicket", ack)
                 self._line(line_callback, "ackDispatchTicket OK", level=logging.DEBUG)
-                return self._finish_dispatch_result(ticket_data["finish_result"], line_callback)
+                return result
             if ticket_status != "QUEUEING":
                 raise RuntimeError(f"ticket failed: {ticket_status}")
             query_interval = int(ticket_data.get("queue_info", {}).get("query_interval") or query_interval)
 
     def run(self, line_callback=None, status_callback=None, stop_event=None) -> dict:
         """执行完整的云游戏调度流程。"""
+        self.last_finish_result = None
+        self.allocation_uncertain = False
+        self._check_stopped(stop_event)
         account_sync = self._require_initialized()
         emit_log_callback(status_callback, "开始获取连接凭证", logging.INFO)
 
         headers = self._dispatch_headers()
         self._log_account_sync(account_sync, line_callback)
+        self._check_stopped(stop_event)
         self._status_check(headers, line_callback)
+        self._check_stopped(stop_event)
         self._list_ping_servers(headers, line_callback)
+        self._check_stopped(stop_event)
         node = self._get_selected_node(headers, line_callback)
+        self._check_stopped(stop_event)
         self._pre_dispatch_verify(node, headers, line_callback)
 
         dispatch_payload = self._paas_dispatch_payload(node)
         self._line(line_callback, f"paasDispatch queue_type={dispatch_payload.get('queue_type')!r}", level=logging.DEBUG)
-        dispatch = self._dispatch_post("/dispatcher/api/paasDispatch", dispatch_payload, headers)
+        self._check_stopped(stop_event)
+        self.allocation_uncertain = True
+        try:
+            dispatch = self._dispatch_post("/dispatcher/api/paasDispatch", dispatch_payload, headers, stop_event=stop_event)
+        except RuntimeError as exc:
+            if str(exc) == "dispatch stopped":
+                self.allocation_uncertain = False
+            raise
+        if dispatch.get("retcode") != 0:
+            self.allocation_uncertain = False
         self._assert_ok("paasDispatch", dispatch)
         result_code = (dispatch.get("data") or {}).get("result_code")
         self._line(line_callback, f"paasDispatch result: {result_code}", level=logging.DEBUG)
@@ -831,11 +860,15 @@ class Dispatcher:
         try:
             return self._poll_dispatch_ticket(ticket_payload, query_interval, headers, line_callback, stop_event)
         except Exception:
+            if self.last_finish_result is not None:
+                raise
             leave = self._dispatch_post(
                 "/dispatcher/api/leaveDispatchQueue",
                 {**ticket_payload, "leave_type": 1}, headers,
             )
             self._assert_ok("leaveDispatchQueue", leave)
+            self.allocation_uncertain = False
+            self._check_stopped(stop_event)
             raise
 
 

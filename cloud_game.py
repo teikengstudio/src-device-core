@@ -327,17 +327,18 @@ class CloudGame:
         self.account.channel_token = account_sync.get("channel_token") or self.account.channel_token
         self.account.open_id = str(account_sync.get("open_id") or self.account.open_id or "")
 
-    def _init_dispatcher(self, dispatcher: Dispatcher | None = None) -> dict:
+    def _init_dispatcher(self, dispatcher: Dispatcher | None = None, stop_event=None) -> dict:
         """初始化 Dispatcher，并把需要跨阶段复用的账号态写回运行配置。
 
         参数:
             dispatcher: 本次操作使用的调度器实例；None 表示使用统一实例。
+            stop_event: 外部取消事件；取消后不再交换账号凭据。
 
         返回:
             ``Dispatcher.init()`` 返回的账号同步结果。
         """
         dispatcher = dispatcher or self.dispatcher
-        account_sync = dispatcher.init()
+        account_sync = dispatcher.init(stop_event=stop_event)
         self._store_account_sync(account_sync)
         return account_sync
 
@@ -543,14 +544,18 @@ class CloudGame:
         运行配置中，后续 ``connect()`` 可直接复用，避免重复登录交换。
         """
         dispatcher = self.dispatcher
-        self._init_dispatcher(dispatcher)
-        result = dispatcher.run(
-            line_callback=lambda line, level: self._emit_dispatch_line(line, level),
-            status_callback=lambda message, level: self._emit_status(message, level),
-            stop_event=stop_event,
-        )
-        self.state.latest_finish_result = result
-        return result
+        self.state.latest_finish_result = None
+        dispatcher.last_finish_result = None
+        try:
+            self._init_dispatcher(dispatcher, stop_event=stop_event)
+            return dispatcher.run(
+                line_callback=lambda line, level: self._emit_dispatch_line(line, level),
+                status_callback=lambda message, level: self._emit_status(message, level),
+                stop_event=stop_event,
+            )
+        finally:
+            # An allocated ticket remains usable for exit even if its ACK fails.
+            self.state.latest_finish_result = dispatcher.last_finish_result
 
     def get_wallet_info(self) -> dict:
         """查询账号剩余时长。
@@ -587,16 +592,20 @@ class CloudGame:
 
         参数:
             finish_result: 调度完成结果；优先级高于 ``state.latest_finish_result``。
-            stop_event: 外部停止事件；被设置后会话会主动关闭 WebSocket。
+            stop_event: 外部停止事件；已分配实例会发送退出请求并等待确认。
 
         如果没有缓存的 SDK login，但已有 Cookie，本方法会在启动 WebRTC
         会话前同步一次账号；这是从保存的 ``finish_result.json`` 直接连接时
         必要的补齐步骤。
         """
-        if self.account.cookie and not self.account.sdk_login:
-            # connect-only 可能来自新进程加载的 finish_result，此时没有
-            # dispatch 阶段缓存下来的账号同步结果，需要在这里补一次。
-            self._init_dispatcher()
+        if (self.account.cookie and not self.account.sdk_login
+                and not (stop_event is not None and stop_event.is_set())):
+            # Connect-only requires credentials for play, but not for remote exit.
+            try:
+                await asyncio.to_thread(self._init_dispatcher, stop_event=stop_event)
+            except Exception:
+                if stop_event is None or not stop_event.is_set():
+                    raise
         session_config = self.session_config
         session_config.finish_result = finish_result or self.state.latest_finish_result
 
@@ -644,12 +653,16 @@ class CloudGame:
         ``connect()``，依赖已有的 ``state.latest_finish_result`` 或由会话层报告缺失。
         """
         result = None
-        if dispatch:
-            result = self.dispatch(stop_event=stop_event)
-        self.state.latest_finish_result = result
-        if connect and not (stop_event is not None and stop_event.is_set()):
-            await self.connect(
-                finish_result=result,
-                stop_event=stop_event,
-            )
+        try:
+            if dispatch:
+                result = self.dispatch(stop_event=stop_event)
+        except Exception:
+            if self.state.latest_finish_result is not None:
+                exit_event = threading.Event()
+                exit_event.set()
+                await self.connect(finish_result=self.state.latest_finish_result, stop_event=exit_event)
+            raise
+        cancelled = stop_event is not None and stop_event.is_set()
+        if (connect or cancelled) and (not cancelled or result is not None or self.state.latest_finish_result is not None):
+            await self.connect(finish_result=result, stop_event=stop_event)
         return result
