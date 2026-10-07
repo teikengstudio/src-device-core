@@ -359,7 +359,7 @@ def verify_action_ticket_partly(
     抓包请求体（133 字节）::
 
         {"action_ticket": "<32 hex>", "action_type": "verify_for_component",
-         "verify_method": 1, "mobile_captcha": "909286"}
+         "verify_method": 1, "mobile_captcha": "<6 位短信码>"}
     """
     body: dict[str, Any] = {
         "action_ticket": challenge.action_ticket,
@@ -456,7 +456,7 @@ def complete_identity_verification(
         session: 与失败的 ``loginByPassword`` **同一个** session（cookie 要连续）。
         headers: 登录请求用的头（函数内部会为 iframe 步骤换 referer）。
         challenge: :func:`parse_verify_header` 的结果。
-        on_sms_code: 交互回调，入参 ``{"mobile": 脱敏手机号, "methods": [...], "info": ...}``，
+        on_sms_code: 交互回调，入参 ``{"mobile": 脱敏手机号, "methods": [1]}``，
             返回用户输入的短信验证码。
         on_aigis: 发短信触发极验时的人工解验证码回调（见 ``core.aigis``）。
         on_status: 进度回调（默认走 logger）。
@@ -488,18 +488,14 @@ def complete_identity_verification(
     verify_info = info.get("verify_info") or {}
     user_info = info.get("user_info") or {}
     methods = list(verify_info.get("chosen_methods") or [])
-    if not methods:
-        for combo in verify_info.get("verify_method_combinations") or []:
-            methods.extend(combo.get("verify_methods") or [])
-    mobile = user_info.get("mobile") or ""
-    report(
-        "       验证方式="
-        + ", ".join(f"{VERIFY_METHOD_NAMES.get(m, m)}({m})" for m in methods)
-        + f", 手机={mobile or '-'}"
-    )
+    mobile = user_info.get("mobile")
+    mobile = mobile if (isinstance(mobile, str) and "*" in mobile and len(mobile) <= 32
+                        and set(mobile) <= set("0123456789*+- ()")
+                        and sum(c in "0123456789" for c in mobile) <= 7) else "绑定手机"
+    report("       验证方式=" + ", ".join(f"{VERIFY_METHOD_NAMES.get(m, m)}({m})" for m in methods))
 
     # 3) 按验证方式下发验证码（本轮只实现抓包覆盖的手机短信；其余类型明确报错）
-    if VERIFY_METHOD_MOBILE not in methods:
+    if methods != [VERIFY_METHOD_MOBILE]:
         names = ", ".join(f"{VERIFY_METHOD_NAMES.get(m, m)}({m})" for m in methods) or "无"
         raise RiskVerificationError(
             f"服务端要求的验证方式 [{names}] 暂未实现（样本只覆盖 verify_method=1 手机短信）",
@@ -515,9 +511,9 @@ def complete_identity_verification(
     report(f"       短信验证码已下发至 {mobile or '绑定手机'}")
 
     # 4) 人工输入验证码
-    code = str(on_sms_code({"mobile": mobile, "methods": methods, "info": info}) or "").strip()
-    if not code:
-        raise RiskVerificationError("没有收到短信验证码输入", stage="verifyActionTicketPartly")
+    code = on_sms_code({"mobile": mobile, "methods": [VERIFY_METHOD_MOBILE]})
+    if not isinstance(code, str) or len(code) != 6 or any(c not in "0123456789" for c in code):
+        raise RiskVerificationError("请输入六位短信验证码", stage="verifyActionTicketPartly")
     verified = verify_action_ticket_partly(
         session, iframe_headers, challenge, code, verify_method=VERIFY_METHOD_MOBILE, timeout=timeout
     )

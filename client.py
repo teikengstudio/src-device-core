@@ -145,7 +145,11 @@ class CloudClient:
             self.account.ensure_login(self._game)
 
     def _dispatch(self):
-        for attempt in range(2):
+        login_retried = False
+        reward_attempted = False
+        while True:
+            if self._stop_event.is_set():
+                raise RuntimeError("dispatch stopped")
             queue_type = self.queue_getter() if self.queue_getter else self.queue_type
             if queue_type not in ("", "coin"):
                 raise ValueError("Unsupported cloud queue type")
@@ -153,6 +157,8 @@ class CloudClient:
             self._game.config = replace(self._game.config, queue_type=queue_type)
             self._game._reset_dispatcher()
             try:
+                if self._stop_event.is_set():
+                    raise RuntimeError("dispatch stopped")
                 return self._game.dispatch(stop_event=self._stop_event)
             except Exception as exc:
                 if self._stop_event.is_set():
@@ -160,10 +166,29 @@ class CloudClient:
                         self.error = "Cloud queue exit was not acknowledged; check the cloud queue."
                         self._allocation_uncertain = True
                     raise
-                if attempt or not isinstance(exc, RuntimeError) or not re.search(r"retcode=-100\b", str(exc)):
+                if not isinstance(exc, RuntimeError):
                     raise
-                self.status = "Authenticating"
-                self._authenticate()
+                if not login_retried and re.search(r"retcode=-100\b", str(exc)):
+                    login_retried = True
+                    self.status = "Authenticating"
+                    self._authenticate()
+                elif not reward_attempted and re.search(r"retcode=-110003\b", str(exc)):
+                    reward_attempted = True
+                    self.status = "Confirming version reward"
+                    logger.info('可用时长不足，尝试确认一次600分钟版本福利通知。')
+                    try:
+                        has_free_time = self._game.dispatcher.claim_version_reward(stop_event=self._stop_event)
+                    except Exception:
+                        if self._stop_event.is_set():
+                            raise RuntimeError("dispatch stopped") from None
+                        raise CloudConnectionError("确认600分钟福利通知或查询时长失败，已停止确认及调度重试。请检查官方页面的免费时长。") from None
+                    if self._stop_event.is_set():
+                        raise RuntimeError("dispatch stopped")
+                    if not has_free_time:
+                        raise CloudConnectionError("确认版本福利后仍无可用免费时长（retcode=-110003），已停止调度重试。请检查官方页面。") from None
+                    logger.info('免费时长已可用，重试一次云游戏调度。')
+                else:
+                    raise
 
     async def _cancel_watcher(self, connection):
         while not self._stop_event.is_set() and not connection.done():

@@ -145,13 +145,33 @@ GEETEST_JS = r"""
 """
 
 
+SMS_JS = r"""
+(() => {
+    const form = document.getElementById(element_id);
+    if (!form) return;
+    let used = false;
+    form.addEventListener('submit', event => {
+        event.preventDefault();
+        if (used || !form.isConnected || Date.now() / 1000 >= challenge.expires_at) return;
+        const input = form.querySelector('input');
+        if (!/^[0-9]{6}$/.test(input.value)) { input.reportValidity(); return; }
+        used = true;
+        const code = input.value;
+        input.value = '';
+        form.querySelector('button').disabled = true;
+        WebIO.pushData({challenge_id: challenge_id, result: code}, callback_id);
+    });
+})();
+"""
+
+
 def render_login_challenge(login):
     """Open the current human challenge in this authenticated PyWebIO session."""
     from .account import CloudAccountError
     from .aigis import GEETEST_V3_JS_URL, GEETEST_V4_JS_URL
     snapshot = login.snapshot()
     challenge, challenge_id = snapshot['challenge'], snapshot['challenge_id']
-    if not challenge or challenge.get('type') != 'geetest' or not challenge_id:
+    if not challenge or challenge.get('type') not in {'geetest', 'sms'} or not challenge_id:
         return False
     element_id = 'cloud-captcha-' + challenge_id
 
@@ -161,22 +181,41 @@ def render_login_challenge(login):
                 raise CloudAccountError('Invalid human verification response.', kind='captcha')
             if payload['challenge_id'] != challenge_id:
                 raise CloudAccountError('Human verification belongs to another challenge.', kind='captcha')
-            login.submit_captcha(challenge_id, payload['result'])
-            close_popup()
+            if challenge['type'] == 'sms':
+                login.submit_sms_code(challenge_id, payload['result'])
+            else:
+                login.submit_captcha(challenge_id, payload['result'])
+            if getattr(local, 'cloud_challenge_id', None) == challenge_id:
+                local.cloud_challenge_id = None
+                close_popup()
         except CloudAccountError:
             toast('验证结果无效、已使用或已过期，请重新登录。', color='error')
 
     def cancel():
         login.cancel(challenge_id=challenge_id)
-        close_popup()
+        if getattr(local, 'cloud_challenge_id', None) == challenge_id:
+            local.cloud_challenge_id = None
+            close_popup()
 
     callback_id = output_register_callback(submit)
     local.cloud_challenge_id = challenge_id
-    popup('人工验证', [put_html('<div id="%s"></div>' % element_id),
-                       put_buttons([dict(label='取消登录', value='cancel', color='off')],
-                                   onclick=lambda _: cancel())], closable=False)
-    run_js(GEETEST_JS, element_id=element_id, challenge=challenge, challenge_id=challenge_id,
-           callback_id=callback_id, v4_url=GEETEST_V4_JS_URL, v3_url=GEETEST_V3_JS_URL)
+    cancel_button = put_buttons([dict(label='取消登录', value='cancel', color='off')],
+                               onclick=lambda _: cancel())
+    if challenge['type'] == 'sms':
+        popup('短信身份验证', [put_text('验证码已发送至 ' + challenge['mobile']),
+                               put_html('<form id="%s">'
+                                        '<label>六位短信验证码 '
+                                        '<input type="text" inputmode="numeric" autocomplete="one-time-code" '
+                                        'pattern="[0-9]{6}" minlength="6" maxlength="6" required '
+                                        'aria-label="六位短信验证码"></label> '
+                                        '<button type="submit" class="btn btn-primary">提交验证码</button>'
+                                        '</form>' % element_id), cancel_button], closable=False)
+        run_js(SMS_JS, element_id=element_id, challenge=challenge, challenge_id=challenge_id,
+               callback_id=callback_id)
+    else:
+        popup('人工验证', [put_html('<div id="%s"></div>' % element_id), cancel_button], closable=False)
+        run_js(GEETEST_JS, element_id=element_id, challenge=challenge, challenge_id=challenge_id,
+               callback_id=callback_id, v4_url=GEETEST_V4_JS_URL, v3_url=GEETEST_V3_JS_URL)
     return True
 
 
@@ -194,7 +233,7 @@ def render_cloud_auth(config_name):
 _LOGIN_TEXT = {
     'idle': '未登录', 'authenticating': '正在登录', 'qr_waiting': '等待扫码',
     'qr_scanned': '已扫码，等待手机确认', 'authenticated': '已登录',
-    'login_required': '请登录', 'captcha_required': '等待人工极验',
+    'login_required': '请登录', 'captcha_required': '等待人工验证',
     'qr_expired': '二维码已过期，请刷新',
     'identity_required': '需要官方身份或短信验证', 'account_restricted': '需要官方账号处理',
     'cancelled': '已取消', 'error': '登录失败',

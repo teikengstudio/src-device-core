@@ -311,6 +311,8 @@ class CloudAccount:
                 raise CloudAccountError("Cloud password login requires official captcha, identity verification, or account recovery; no retry was attempted.", kind="risk", retcode=code) from None
             safe_code = str(code) if type(code) is int else "unknown"
             raise CloudAccountError("Cloud password login failed (retcode " + safe_code + "); check credentials on the official website.", kind="authentication", retcode=code) from None
+        except CloudAccountError:
+            raise
         except Exception:
             check_cancelled()
             raise CloudAccountError("Cloud password login failed; no retry was attempted.", kind="authentication") from None

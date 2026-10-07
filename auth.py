@@ -783,7 +783,7 @@ class Authenticator:
                 请求头, 然后用**同一个请求体**重试一次 (与浏览器 axios 重试一致)。
                 现成的实现见 ``core.aigis.browser_aigis_solver()``。
             on_sms_code: 身份验证 (``-3235 AccountRisky``) 时收短信验证码的回调。
-                入参形如 ``{"mobile": 脱敏手机号, "methods": [1], "info": {...}}``,
+                入参形如 ``{"mobile": 脱敏手机号, "methods": [1]}``,
                 返回用户输入的验证码。给了它, 库会自动跑完
                 ``markRiskAction → getActionTicketInfo → 发短信(含极验)
                 → verifyActionTicketPartly → checkRiskVerified``,
@@ -847,16 +847,7 @@ class Authenticator:
         ):
             challenge = parse_aigis_header(response.headers.get("x-rpc-aigis"))
             report("[风控] retcode=-3101: 需要极验验证码")
-            try:
-                header_value = str(on_aigis(challenge or {}))
-            except Exception as exc:
-                raise PasswordLoginError(
-                    f"极验验证未完成: {exc}",
-                    retcode=RETCODE_NEED_AIGIS,
-                    hint=PASSWORD_LOGIN_HINTS.get(RETCODE_NEED_AIGIS, ""),
-                    aigis=challenge,
-                    payload=payload,
-                ) from exc
+            header_value = str(on_aigis(challenge or {}))
             if not header_value:
                 raise PasswordLoginError(
                     "on_aigis 没有返回 x-rpc-aigis 头值",

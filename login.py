@@ -90,6 +90,41 @@ class CloudLogin:
                 self.account.save_cookie(cookie)
             game._apply_credentials(cookie)
 
+    def _wait_challenge(self, challenge, token, cancel, external=None):
+        challenge_id = secrets.token_urlsafe(24)
+        challenge = dict(challenge, expires_at=time.time() + 180)
+        self._update(token, cancel, state="captcha_required", challenge_id=challenge_id,
+                     challenge=challenge, result=None)
+        while True:
+            with self._lock:
+                self._check(token, cancel, external)
+                if time.time() >= challenge["expires_at"]:
+                    raise CloudAccountError("Human verification expired; start login again.", kind="captcha")
+                if self._result is not None:
+                    result = self._result
+                    self._result = self._challenge = self._challenge_id = None
+                    self._state = "authenticating"
+                    return result
+            cancel.wait(0.15)
+
+    def on_sms_code(self, challenge, token, cancel, external=None):
+        mobile = challenge.get("mobile") if isinstance(challenge, dict) else None
+        mobile = mobile if (isinstance(mobile, str) and "*" in mobile and len(mobile) <= 32
+                            and set(mobile) <= set("0123456789*+- ()")
+                            and sum(c in "0123456789" for c in mobile) <= 7) else "绑定手机"
+        return self._wait_challenge(dict(type="sms", mobile=mobile), token, cancel, external)
+
+    def submit_sms_code(self, challenge_id, code):
+        with self._lock:
+            challenge = self._challenge
+            if (not self._active or self._cancel.is_set() or challenge_id != self._challenge_id
+                    or not challenge or challenge.get("type") != "sms"
+                    or time.time() >= challenge["expires_at"] or self._result is not None):
+                raise CloudAccountError("Human verification is expired or already used.", kind="captcha")
+            if not isinstance(code, str) or len(code) != 6 or any(c not in "0123456789" for c in code):
+                raise CloudAccountError("Enter the six-digit SMS code.", kind="captcha")
+            self._result = code
+
     def _aigis(self, challenge, token, cancel, external=None):
         config = challenge.get("data") if isinstance(challenge, dict) else None
         if not isinstance(config, dict) or not isinstance(config.get("gt"), str) or not config["gt"]:
@@ -102,22 +137,8 @@ class CloudLogin:
         session_id = challenge.get("session_id") or ""
         if not isinstance(session_id, str) or len(session_id) > 1024 or any(c in session_id for c in ";\r\n"):
             raise CloudAccountError("Invalid official Geetest session.", kind="captcha")
-        challenge_id = secrets.token_urlsafe(24)
-        expires_at = time.time() + 180
-        self._update(token, cancel, state="captcha_required", challenge_id=challenge_id,
-                     challenge=dict(type="geetest", data=safe, session_id=session_id, expires_at=expires_at),
-                     result=None)
-        while True:
-            with self._lock:
-                self._check(token, cancel, external)
-                if time.time() >= expires_at:
-                    raise CloudAccountError("Human verification expired; start login again.", kind="captcha")
-                if self._result is not None:
-                    result = self._result
-                    self._result = self._challenge = self._challenge_id = None
-                    self._state = "authenticating"
-                    break
-            cancel.wait(0.15)
+        result = self._wait_challenge(dict(type="geetest", data=safe, session_id=session_id),
+                                      token, cancel, external)
         if session_id:
             return build_aigis_header(session_id, result)
         payload = json.dumps(result, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
@@ -195,6 +216,7 @@ class CloudLogin:
                 else:
                     self.account.ensure_login(
                         game, on_aigis=lambda challenge: self._aigis(challenge, token, cancel, external),
+                        on_sms_code=lambda challenge: self.on_sms_code(challenge, token, cancel, external),
                         cancel_event=cancel, commit=commit, force_password=force_password,
                     )
         except Exception as exc:

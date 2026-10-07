@@ -505,6 +505,46 @@ class Dispatcher:
         data = wallet.get("data") or {}
         return {"summary": self._wallet_summary(data), "data": data}
 
+    def claim_version_reward(self, stop_event=None) -> bool:
+        """确认一条 600 分钟版本福利通知，返回免费时长是否可用。"""
+        self._require_initialized()
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("dispatch stopped")
+        headers = self._dispatch_headers()
+        notifications = self._dispatch_get(
+            "/gamer/api/listNotifications", headers,
+            params={"status": "NotificationStatusUnread", "type": "NotificationTypePopup", "is_sort": "true"},
+        )
+        self._assert_ok("listNotifications", notifications)
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("dispatch stopped")
+        for notification in (notifications.get("data") or {}).get("list") or []:
+            if not isinstance(notification, dict):
+                continue
+            if (notification.get("status") != "NotificationStatusUnread"
+                    or notification.get("type") != "NotificationTypePopup"
+                    or not isinstance(notification.get("id"), str) or not notification["id"]):
+                continue
+            try:
+                message = json.loads(notification.get("msg") or "")
+            except (TypeError, ValueError):
+                continue
+            if not isinstance(message, dict) or (message.get("num"), message.get("type"), message.get("func_type")) != (600, 2, 9):
+                continue
+            # Free time can arrive before ACK; confirming the notification is not proof of granting time.
+            if stop_event is not None and stop_event.is_set():
+                raise RuntimeError("dispatch stopped")
+            ack = self._dispatch_post("/gamer/api/ackNotification", {"id": notification["id"]}, headers)
+            self._assert_ok("ackNotification", ack)
+            break
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("dispatch stopped")
+        wallet = self._dispatch_get(WALLET_GET_PATH, headers)
+        self._assert_ok("walletGet", wallet)
+        if stop_event is not None and stop_event.is_set():
+            raise RuntimeError("dispatch stopped")
+        return self._wallet_summary(wallet.get("data"))["free_time_minutes"] > 0
+
     def queue_estimate(self, line_callback=None, status_callback=None) -> dict:
         """在正式 dispatch 前查询普通队列和星云币优先队列的预估信息。"""
         self._require_initialized()
