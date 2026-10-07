@@ -378,6 +378,7 @@ class CloudGame:
             clipboard_getter=self.config.clipboard_getter,
             core_config=self.config.core_config,
             video_frame_request_event=self._video_frame_request,
+            game_data_dir=self.config.root_dir / 'config' / 'cloud' / 'game-settings',
         )
 
     @staticmethod

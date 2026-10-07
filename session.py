@@ -21,6 +21,7 @@ from urllib3.util.ssl_match_hostname import CertificateError, match_hostname
 
 from .config import CoreConfig, normalize_core_config
 from .log import emit_log_callback, get_logger
+from .game_settings import GameSettingsStore, enable_auto_battle, validate_game_data
 from .protocol import (
     CMD_KCP_CONNECT_ACK,
     CMD_KCP_CONNECT_SYNC,
@@ -145,9 +146,10 @@ class SdkGameDataHandler:
             channel_token: str = "",
             clipboard_getter: Callable[[], str] | None = None,
             core_config: CoreConfig | dict | None = None,
+            game_data_dir: Path | str | None = None,
     ) -> None:
         """初始化实例并保存运行所需的状态。"""
-        self.cloud_data: dict[str, str] = {}
+        self.cloud_data: dict = {}
         self.sdk_login = sdk_login
         self.cookie = cookie or ""
         self.combo_token = combo_token
@@ -155,6 +157,33 @@ class SdkGameDataHandler:
         self.clipboard_text = ""
         self.clipboard_getter = clipboard_getter
         self.core_config = normalize_core_config(core_config)
+        login_data = self._login_response().get('data') or {}
+        self.account_id = str(login_data.get('open_id') or self._cookie_value('account_id_v2')
+                              or self._cookie_value('account_id') or '')
+        self._game_data_store = None
+        loaded = game_data_dir is None
+        if game_data_dir is not None:
+            try:
+                self._game_data_store = GameSettingsStore(game_data_dir, self.account_id)
+                self.cloud_data = self._game_data_store.load()
+                loaded = True
+            except Exception as exc:
+                logger.warning('读取游戏设置失败（%s），继续启动', type(exc).__name__)
+        try:
+            self.cloud_data, has_uid = enable_auto_battle(self.cloud_data)
+            if not has_uid:
+                logger.info('游戏设置尚未记录 UID；已开启自动战斗和倍速状态保存，记录 UID 后下次启动配置倍速')
+            if loaded:
+                self._save_cloud_data()
+        except Exception as exc:
+            logger.warning('启用自动战斗和战斗倍速失败（%s），继续启动', type(exc).__name__)
+
+    def _save_cloud_data(self):
+        if self._game_data_store is not None:
+            try:
+                self._game_data_store.save(self.cloud_data)
+            except Exception as exc:
+                logger.warning('保存游戏设置失败（%s），继续运行', type(exc).__name__)
 
     def _cookie_value(self, name: str, default: str = "") -> str:
         """从 Cookie 字符串中读取指定键值。"""
@@ -291,6 +320,8 @@ class SdkGameDataHandler:
             return [self._response(index, self._clipboard_response(str(raw_params)))]
         if function_name == "cloud_get_data":
             key = str(raw_params)
+            if key == 'account_id':
+                return [self._response(index, {'account_id': self.account_id})]
             return [self._response(index, self.cloud_data.get(key, ""))]
         if function_name == "cloud_set_data":
             self._store_cloud_data(raw_params)
@@ -307,19 +338,14 @@ class SdkGameDataHandler:
         return []
 
     def _store_cloud_data(self, raw_params) -> None:
-        """解析并写入 cloud_set_data 的键值。"""
         try:
             params = json.loads(raw_params)
-        except Exception:
+            validate_game_data(params)
+        except Exception as exc:
+            logger.warning('游戏设置写入数据无效（%s），保留原设置继续运行', type(exc).__name__)
             return
-        if "key" in params or "name" in params:
-            key = str(params.get("key") or params.get("name") or "")
-            value = params.get("data", "")
-            if key:
-                self.cloud_data[key] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
-            return
-        for key, value in params.items():
-            self.cloud_data[str(key)] = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False)
+        self.cloud_data = params
+        self._save_cloud_data()
 
     def _handle_invoke_return(self, index: int, raw_params) -> list[dict]:
         """处理 invoke_return 调用。"""
@@ -796,6 +822,7 @@ class SessionConfig:
     clipboard_getter: Callable[[], str] | None = None
     core_config: CoreConfig = field(default_factory=CoreConfig)
     video_frame_request_event: threading.Event | None = None
+    game_data_dir: Path | str | None = None
 
 
 class GameSession:
@@ -850,6 +877,7 @@ class GameSession:
             channel_token=config.channel_token,
             clipboard_getter=config.clipboard_getter,
             core_config=config.core_config,
+            game_data_dir=config.game_data_dir,
         )
 
         # ---- 运行时状态 ----
