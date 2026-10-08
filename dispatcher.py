@@ -14,6 +14,7 @@ import requests
 from .auth import WEB_VERIFY_URL, parse_cookie_header
 from .config import CoreConfig
 from .log import emit_log_callback, get_logger
+from .release import announce_load, prepare_load
 
 # ---------------------------------------------------------------------------
 # 服务端点
@@ -819,6 +820,9 @@ class Dispatcher:
         self.allocation_uncertain = False
         self._check_stopped(stop_event)
         account_sync = self._require_initialized()
+        prepare_load()
+        self._check_stopped(stop_event)
+        announce_load()
         emit_log_callback(status_callback, "开始获取连接凭证", logging.INFO)
 
         headers = self._dispatch_headers()

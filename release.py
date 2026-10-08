@@ -7,7 +7,7 @@ from urllib.request import Request, urlopen
 
 from module.logger import logger
 
-VERSION = 4
+VERSION = 5
 REPOSITORY_URL = 'https://github.com/teikengstudio/src-device-core'
 REPOSITORY_API = 'https://api.github.com/repos/teikengstudio/src-device-core'
 VERSION_URL = 'https://teikengstudio.github.io/src-device-core/version.json'
