@@ -61,7 +61,7 @@ def validate_input(action):
 
 class CloudClient:
     def __init__(self, config_name, queue_type="", root_dir=None, auth_handler=None,
-                 queue_getter=None, on_frame=None, on_connected=None):
+                 queue_getter=None, on_frame=None, on_connected=None, on_release_log=None):
         if queue_type not in ("", "coin"):
             raise ValueError("Unsupported cloud queue type")
         self.account = CloudAccount(config_name, root_dir=root_dir)
@@ -70,6 +70,7 @@ class CloudClient:
         self.queue_getter = queue_getter
         self.on_frame = on_frame
         self.on_connected = on_connected
+        self.on_release_log = on_release_log
         self.status = "Disconnected"
         self.queue_log = ""
         self.error = None
@@ -263,7 +264,7 @@ class CloudClient:
                             queue_type=self.queue_type, ws_log_payload=False,
                             video_frame_interval=0.1 if self.on_frame else None),
             callbacks=CloudGameCallbacks(on_status=self._status, on_dispatch_log=self._dispatch_log,
-                                        on_video_frame=self.on_frame),
+                                        on_video_frame=self.on_frame, on_release_log=self.on_release_log),
             qr_dir=self.account.root_dir / "log",
         )
         finish = None

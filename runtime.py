@@ -1,5 +1,6 @@
 """One WebUI-owned cloud connection and a spawn-safe scheduler bridge."""
 
+from collections import deque
 import io
 import queue
 import threading
@@ -48,6 +49,8 @@ class CloudRuntime:
         self._scheduler = False
         self._scheduler_allowed = False
         self._lease = None
+        self._release_logs = deque(maxlen=64)
+        self._release_log_sequence = 0
         self._pause_requested = False
         self._paused = False
         self._control_owner = None
@@ -70,7 +73,14 @@ class CloudRuntime:
         self._capture_slots = threading.BoundedSemaphore(4)
         self.client = CloudClient(config_name, auth_handler=self._authenticate,
                                   queue_getter=self._queue_type, on_frame=self._frame,
-                                  on_connected=self._connected)
+                                  on_connected=self._connected, on_release_log=self._release_log)
+
+    def _release_log(self, message, level):
+        with self._lock:
+            self._release_log_sequence += 1
+            self._release_logs.append((self._release_log_sequence, level, message))
+            if self._bridge is not None:
+                self._bridge['state']['release_logs'] = list(self._release_logs)
 
     def _authenticate(self, game, cancel_event=None):
         from .login import get_login
@@ -130,7 +140,7 @@ class CloudRuntime:
                 self._bridge["state"].update(self.snapshot())
                 threading.Thread(target=self._commands, name="cloud-bridge", daemon=True).start()
                 threading.Thread(target=self._publish, name="cloud-status", daemon=True).start()
-            return dict(self._bridge, lease=self._lease)
+            return dict(self._bridge, lease=self._lease, release_log_sequence=self._release_log_sequence)
 
     def snapshot(self):
         with self._lock:
@@ -141,6 +151,7 @@ class CloudRuntime:
                     "busy": self._closing or self.client.status in ("Authenticating", "Waiting in queue", "Connecting", "Reconnecting"),
                     "queue_type": self.client.queue_type, "paused": self._paused,
                     "queue_log": self.client.queue_log,
+                    "release_logs": list(self._release_logs),
                     "pause_requested": self._pause_requested,
                     "pending_owner": self._pending_owner,
                     "control_owner": self._control_owner, "scheduler": self._scheduler,
@@ -546,6 +557,7 @@ class CloudProxy:
     def __init__(self, bridge):
         self.bridge = bridge
         self._lease = bridge.get("lease")
+        self._release_log_sequence = bridge.get('release_log_sequence', 0)
         self._heartbeat_stop = threading.Event()
         self._heartbeat_thread = None
 
@@ -590,6 +602,14 @@ class CloudProxy:
             raise CloudConnectionError("Cloud WebUI bridge is unavailable.") from None
         raise CloudConnectionError("Cloud bridge request timed out.")
 
+    def _drain_release_logs(self):
+        if self._lease != self.bridge['state'].get('lease'):
+            return
+        for sequence, level, message in self.bridge['state'].get('release_logs', []):
+            if sequence > self._release_log_sequence:
+                logger.log(level, message)
+                self._release_log_sequence = sequence
+
     def start(self, cancel_event=None):
         self._check_lease()
         if self._heartbeat_thread is None or not self._heartbeat_thread.is_alive() or self._heartbeat_stop.is_set():
@@ -599,8 +619,11 @@ class CloudProxy:
         try:
             self._call("start")
             last_queue_log = ""
-            while not self.running:
+            while True:
                 self._check_lease()
+                self._drain_release_logs()
+                if self.running:
+                    return
                 if cancel_event is not None and cancel_event.is_set():
                     self.stop()
                     raise CloudConnectionError("Cloud connection was cancelled.")
@@ -616,6 +639,8 @@ class CloudProxy:
         except Exception:
             self._heartbeat_stop.set()
             raise
+        finally:
+            self._drain_release_logs()
 
     def _heartbeat(self, stop_event):
         while not stop_event.is_set():

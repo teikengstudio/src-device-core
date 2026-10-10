@@ -76,6 +76,7 @@ class CloudGameCallbacks:
     on_video_frame: Callable[[Any, int], None] | None = None
     on_ws_event: Callable[[dict], None] | None = None
     on_input_ready: Callable[[bool], None] | None = None
+    on_release_log: Callable[[str, int], None] | None = None
 
 
 class CloudGame:
@@ -553,6 +554,7 @@ class CloudGame:
                 line_callback=lambda line, level: self._emit_dispatch_line(line, level),
                 status_callback=lambda message, level: self._emit_status(message, level),
                 stop_event=stop_event,
+                release_log_callback=self.callbacks.on_release_log,
             )
         finally:
             # An allocated ticket remains usable for exit even if its ACK fails.

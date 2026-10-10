@@ -814,15 +814,15 @@ class Dispatcher:
                 raise RuntimeError(f"ticket failed: {ticket_status}")
             query_interval = int(ticket_data.get("queue_info", {}).get("query_interval") or query_interval)
 
-    def run(self, line_callback=None, status_callback=None, stop_event=None) -> dict:
+    def run(self, line_callback=None, status_callback=None, stop_event=None, release_log_callback=None) -> dict:
         """执行完整的云游戏调度流程。"""
         self.last_finish_result = None
         self.allocation_uncertain = False
         self._check_stopped(stop_event)
         account_sync = self._require_initialized()
-        prepare_load()
+        prepare_load(release_log_callback)
         self._check_stopped(stop_event)
-        announce_load()
+        announce_load(release_log_callback)
         emit_log_callback(status_callback, "开始获取连接凭证", logging.INFO)
 
         headers = self._dispatch_headers()

@@ -1,13 +1,15 @@
 import configparser
 import json
+import logging
 import random
 from pathlib import Path
 from urllib.error import HTTPError, URLError
 from urllib.request import Request, urlopen
 
 from module.logger import logger
+from .log import emit_log_callback
 
-VERSION = 5
+VERSION = 6
 REPOSITORY_URL = 'https://github.com/teikengstudio/src-device-core'
 REPOSITORY_API = 'https://api.github.com/repos/teikengstudio/src-device-core'
 VERSION_URL = 'https://teikengstudio.github.io/src-device-core/version.json'
@@ -26,6 +28,11 @@ LYRICS = (
 )
 
 
+def _log(message, level, log_callback):
+    logger.log(level, message)
+    emit_log_callback(log_callback, message, level)
+
+
 def _read_json(url):
     request = Request(url, headers={'User-Agent': 'src-device-core', 'Cache-Control': 'no-cache'})
     with urlopen(request, timeout=5) as response:
@@ -35,13 +42,13 @@ def _read_json(url):
     return json.loads(content)
 
 
-def check_update():
+def check_update(log_callback=None):
     failures = []
     try:
         _read_json(REPOSITORY_API)
     except HTTPError as exc:
         if exc.code == 404:
-            logger.error('设备后端仓库不存在，拒绝启动。')
+            _log('设备后端仓库不存在，拒绝启动。', logging.ERROR, log_callback)
             raise RuntimeError('Unsupported device backend') from None
         failures.append(f'仓库检查 HTTP {exc.code}')
     except (OSError, URLError, ValueError) as exc:
@@ -55,16 +62,16 @@ def check_update():
         failures.append(f'版本检查 {type(exc).__name__}')
     else:
         if remote == 0:
-            logger.error('远程版本为 0，设备后端已停用，拒绝启动。')
+            _log('远程版本为 0，设备后端已停用，拒绝启动。', logging.ERROR, log_callback)
             raise RuntimeError('Unsupported device backend')
         if remote > VERSION:
-            logger.warning(f'设备后端有更新：本地 {VERSION}，远程 {remote}。请更新：{REPOSITORY_URL}')
+            _log(f'设备后端有更新：本地 {VERSION}，远程 {remote}。请更新：{REPOSITORY_URL}', logging.WARNING, log_callback)
     if failures:
-        logger.warning('检查更新失败：' + '；'.join(failures))
+        _log('检查更新失败：' + '；'.join(failures), logging.WARNING, log_callback)
 
 
-def require_acceptance():
-    logger.warning(DISCLAIMER)
+def require_acceptance(log_callback=None):
+    _log(DISCLAIMER, logging.WARNING, log_callback)
     try:
         with RULES_PATH.open('x', encoding='utf-8') as file:
             file.write('[Rules]\nAccepted = False\n')
@@ -78,17 +85,17 @@ def require_acceptance():
     except (OSError, configparser.Error):
         accepted = False
     if not accepted:
-        logger.warning(f'尚未确认使用规则。请阅读免责声明并手动将 {RULES_PATH} 中 Accepted = False 改为 Accepted = True。')
+        _log(f'尚未确认使用规则。请阅读免责声明并手动将 {RULES_PATH} 中 Accepted = False 改为 Accepted = True。', logging.WARNING, log_callback)
     return accepted
 
 
-def prepare_load():
-    accepted = require_acceptance()
-    check_update()
+def prepare_load(log_callback=None):
+    accepted = require_acceptance(log_callback)
+    check_update(log_callback)
     if not accepted:
         raise RuntimeError('Unsupported device backend')
 
 
-def announce_load():
-    logger.info(f'设备后端版本：{VERSION}')
-    logger.info('\n' + '\n'.join('♪' + line for line in random.choice(LYRICS)))
+def announce_load(log_callback=None):
+    _log(f'设备后端版本：{VERSION}', logging.INFO, log_callback)
+    _log('\n' + '\n'.join('♪' + line for line in random.choice(LYRICS)), logging.INFO, log_callback)
